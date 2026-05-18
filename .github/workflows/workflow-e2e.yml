@@ -1,0 +1,114 @@
+name: Workflow E2E
+
+# E2E test suite moved to the PUBLIC `caliptic-org/releases` repo to
+# use free unlimited Actions minutes. Source (backend + frontend) is
+# checked out from the private `caliptic-org/caliptic` repo via
+# PRIVATE_REPO_TOKEN.
+#
+# Why this is safe on a public repo:
+# - No `${{ secrets.X }}` usage in this workflow (other than the
+#   cross-repo PAT)
+# - Postgres service uses hardcoded throw-away creds (caliptic/caliptic)
+#   that only exist for the runner-local test DB
+# - `workflow_dispatch` only — no automatic PR/fork triggers
+# - Service logs uploaded as artifacts may contain Go stack traces;
+#   they don't include any production credentials, only test data
+#
+# If you ever add `pull_request` triggers, harden the artifact step:
+# strip or rotate any token-bearing log lines before upload.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Branch/ref in the private repo to test. Defaults to main."
+        required: false
+        default: "main"
+
+jobs:
+  workflow-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: caliptic
+          POSTGRES_PASSWORD: caliptic
+          POSTGRES_DB: caliptic
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U caliptic -d caliptic"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    env:
+      DATABASE_URL: postgres://caliptic:caliptic@localhost:5432/caliptic?sslmode=disable
+      NEXT_PUBLIC_API_URL: http://localhost:8080
+      PORT: "8080"
+      WORKFLOW_ENGINE_ENABLED: "true"
+      APP_ENV: development
+      FRONTEND_ORIGIN: http://localhost:3000
+      CORS_ALLOWED_ORIGINS: http://localhost:3000
+
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v6
+        with:
+          repository: caliptic-org/caliptic
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright browser
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run migrations
+        run: cd server && go run ./cmd/migrate up
+
+      - name: Start backend
+        run: |
+          cd server
+          nohup go run ./cmd/server > /tmp/backend.log 2>&1 &
+          echo $! > /tmp/backend.pid
+
+      - name: Start web frontend
+        run: |
+          nohup pnpm --filter @caliptic/web dev -- --port 3000 > /tmp/web.log 2>&1 &
+          echo $! > /tmp/web.pid
+
+      - name: Wait for services
+        run: |
+          npx wait-on http://localhost:8080/health http://localhost:8080/health/workflows http://localhost:3000
+
+      - name: Run workflow E2E
+        run: pnpm exec playwright test e2e/workflows.spec.ts --project=chromium
+
+      - name: Upload service logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-e2e-logs
+          path: |
+            /tmp/backend.log
+            /tmp/web.log

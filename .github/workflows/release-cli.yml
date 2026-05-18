@@ -1,0 +1,87 @@
+name: Release CLI
+
+# CLI binary release run from the PUBLIC `caliptic-org/releases` repo
+# so it consumes free unlimited Actions minutes instead of the private
+# `caliptic-org/caliptic` repo's paid budget. The source code lives in
+# the private repo; we check it out using a fine-grained PAT stored as
+# the `PRIVATE_REPO_TOKEN` secret on this (public releases) repo.
+#
+# Outputs (GitHub Release on caliptic-org/releases, the same place the
+# old workflow wrote to) and Homebrew tap update are identical to the
+# previous private workflow — only the runner location changes.
+#
+# Manual trigger:
+#   GitHub UI → Actions → Release CLI → "Run workflow" → tag (e.g. v0.1.40)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Semver tag to release (e.g. v0.1.40). Empty = use latest in source repo."
+        required: false
+        default: ""
+      source_ref:
+        description: "Branch/ref in the private repo to build from. Defaults to release."
+        required: false
+        default: "release"
+
+permissions:
+  contents: write   # write the Release on THIS (public) repo
+
+jobs:
+  release:
+    name: Release CLI (GoReleaser)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # ── 1. Check out the SOURCE code from the private repo ──────
+      # PRIVATE_REPO_TOKEN: a fine-grained PAT with `contents: read`
+      # on caliptic-org/caliptic, configured as a secret on
+      # caliptic-org/releases.
+      - name: Checkout private source
+        uses: actions/checkout@v6
+        with:
+          repository: caliptic-org/caliptic
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          fetch-depth: 0
+
+      - name: Reset working tree
+        run: git checkout -- .
+
+      - name: Derive release version
+        id: ver
+        run: |
+          input_tag="${{ github.event.inputs.tag }}"
+          if [ -n "$input_tag" ]; then
+            ver="$input_tag"
+          else
+            ver=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0-dev")
+          fi
+          echo "tag=$ver" >> "$GITHUB_OUTPUT"
+          echo "Using GoReleaser current-tag=$ver"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Run Go tests
+        run: cd server && go test ./...
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean --config ../.goreleaser.yml
+          workdir: server
+        env:
+          # GITHUB_TOKEN scoped to THIS public releases repo would be
+          # enough since .goreleaser.yml targets owner/name=releases.
+          # We still pass RELEASES_TOKEN because the homebrew tap step
+          # needs to write to caliptic-org/homebrew-tap.
+          GITHUB_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ steps.ver.outputs.tag }}

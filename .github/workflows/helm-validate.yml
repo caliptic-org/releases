@@ -1,0 +1,95 @@
+name: Helm Validate
+
+# Helm chart validation moved to the PUBLIC `caliptic-org/releases` repo
+# so it consumes free unlimited Actions minutes instead of the private
+# `caliptic-org/caliptic` repo's paid budget. Source (chart + values
+# files) is checked out from the private repo using PRIVATE_REPO_TOKEN.
+#
+# No secrets used by this workflow's helm commands themselves —
+# they're pure-syntax + template-render checks; output is written to
+# /tmp/ and never echoed to the public log unless `helm template`
+# fails (in which case the error message may include a manifest
+# snippet). The chart structure isn't considered sensitive — only
+# values that aren't in the repo (real workspace credentials) are.
+#
+# Trigger model: original was `push: release` on the private repo.
+# Cross-repo branch triggers don't exist, so we switched to
+# `workflow_dispatch` (manual). If you need it to fire automatically
+# alongside the release-branch deploy, add a tiny private-repo
+# dispatcher workflow that emits `repository_dispatch` on release
+# pushes — see this folder's README for the pattern.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Branch/ref in the private repo to validate. Defaults to release."
+        required: false
+        default: "release"
+
+jobs:
+  helm-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v6
+        with:
+          repository: caliptic-org/caliptic
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Helm lint
+        run: |
+          helm lint deploy/helm/caliptic
+
+      - name: Helm template (onprem)
+        run: |
+          helm template caliptic deploy/helm/caliptic \
+            -f deploy/helm/caliptic/values.yaml \
+            -f deploy/helm/caliptic/values-onprem.yaml > /tmp/caliptic-onprem.yaml
+
+      - name: Helm template (openshift)
+        run: |
+          helm template caliptic deploy/helm/caliptic \
+            -f deploy/helm/caliptic/values.yaml \
+            -f deploy/helm/caliptic/values-openshift.yaml > /tmp/caliptic-openshift.yaml
+
+      - name: Helm template (cloud)
+        run: |
+          helm template caliptic deploy/helm/caliptic \
+            -f deploy/helm/caliptic/values.yaml \
+            -f deploy/helm/caliptic/values-cloud.yaml > /tmp/caliptic-cloud.yaml
+
+      - name: Helm template (tenant override)
+        run: |
+          helm template caliptic-tenant-acme deploy/helm/caliptic \
+            -f deploy/helm/caliptic/values.yaml \
+            -f deploy/helm/caliptic/values-cloud.yaml \
+            -f deploy/helm/caliptic/values-tenant-example.yaml > /tmp/caliptic-tenant.yaml
+
+      - name: Helm template (tenant dev)
+        run: |
+          helm template caliptic-tenant-dev deploy/helm/caliptic \
+            -f deploy/helm/caliptic/values.yaml \
+            -f deploy/helm/caliptic/values-cloud.yaml \
+            -f deploy/helm/caliptic/values-tenant-dev.yaml > /tmp/caliptic-tenant-dev.yaml
+
+      - name: Helm template (tenant staging)
+        run: |
+          helm template caliptic-tenant-staging deploy/helm/caliptic \
+            -f deploy/helm/caliptic/values.yaml \
+            -f deploy/helm/caliptic/values-cloud.yaml \
+            -f deploy/helm/caliptic/values-tenant-staging.yaml > /tmp/caliptic-tenant-staging.yaml
+
+      - name: Helm template (tenant prod)
+        run: |
+          helm template caliptic-tenant-prod deploy/helm/caliptic \
+            -f deploy/helm/caliptic/values.yaml \
+            -f deploy/helm/caliptic/values-cloud.yaml \
+            -f deploy/helm/caliptic/values-tenant-prod.yaml > /tmp/caliptic-tenant-prod.yaml

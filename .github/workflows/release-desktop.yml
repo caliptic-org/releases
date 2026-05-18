@@ -1,0 +1,192 @@
+name: Release Desktop Apps
+
+# Desktop binary release run from the PUBLIC `caliptic-org/releases`
+# repo. macOS Actions minutes cost 10x on private repos; running this
+# on a public repo makes them free. Windows + Linux runners also free
+# on public.
+#
+# Source code is checked out from the private `caliptic-org/caliptic`
+# repo using PRIVATE_REPO_TOKEN (fine-grained PAT with contents:read).
+# electron-builder publishes to GitHub Releases on THIS public repo
+# (the same destination the old private workflow used because the
+# original `release-desktop.yml` env was `GH_TOKEN: RELEASES_TOKEN`,
+# which already targeted the public releases repo).
+#
+# Manual trigger:
+#   GitHub UI → Actions → Release Desktop Apps → "Run workflow"
+# Pre-requisite: a semver tag (e.g. v0.1.40) must exist in the source
+# repo so electron-builder has something to publish against.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Branch/ref in the private repo to build from. Defaults to release."
+        required: false
+        default: "release"
+
+permissions:
+  contents: write   # write GitHub Releases on THIS public repo
+
+jobs:
+  # ── Windows ────────────────────────────────────────────────────────────────
+  build-desktop-windows:
+    name: Build Desktop (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v6
+        with:
+          repository: caliptic-org/caliptic
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          fetch-depth: 0
+
+      - name: Reset working tree
+        run: git checkout -- .
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Windows icons from SVG
+        shell: pwsh
+        run: |
+          $sizes = @(16,24,32,48,64,128,256)
+          $pngs  = @()
+          foreach ($s in $sizes) {
+            $out = "apps/desktop/build/icon-${s}.png"
+            magick convert -background none -size "${s}x${s}" "apps/desktop/build/icon.svg" $out
+            $pngs += $out
+          }
+          $args  = ($pngs -join " ") + " apps/desktop/build/icon.ico"
+          Invoke-Expression "magick convert $args"
+          magick convert -background none -size 512x512 "apps/desktop/build/icon.svg" "apps/desktop/build/icon.png"
+          Remove-Item "apps/desktop/build/icon-*.png" -Force
+
+      - name: Build & publish Windows installer
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          pnpm --filter @caliptic/desktop exec node scripts/package.mjs --win --x64 --publish always
+
+  # ── macOS ──────────────────────────────────────────────────────────────────
+  # Runs in PARALLEL with Windows (no `needs:` link).
+  build-desktop-mac:
+    name: Build Desktop (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v6
+        with:
+          repository: caliptic-org/caliptic
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          fetch-depth: 0
+
+      - name: Reset working tree
+        run: git checkout -- .
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install librsvg for SVG → PNG conversion
+        run: brew install librsvg
+
+      - name: Generate macOS icons from SVG
+        run: |
+          SVG="apps/desktop/build/icon.svg"
+          ICONSET=$(mktemp -d)/icon.iconset
+          mkdir -p "$ICONSET"
+          for SIZE in 16 32 64 128 256 512 1024; do
+            rsvg-convert -w $SIZE -h $SIZE "$SVG" -o "$ICONSET/icon_${SIZE}x${SIZE}.png"
+          done
+          cp "$ICONSET/icon_32x32.png"   "$ICONSET/icon_16x16@2x.png"
+          cp "$ICONSET/icon_64x64.png"   "$ICONSET/icon_32x32@2x.png"
+          cp "$ICONSET/icon_256x256.png" "$ICONSET/icon_128x128@2x.png"
+          cp "$ICONSET/icon_512x512.png" "$ICONSET/icon_256x256@2x.png"
+          cp "$ICONSET/icon_1024x1024.png" "$ICONSET/icon_512x512@2x.png"
+          iconutil -c icns "$ICONSET" -o apps/desktop/build/icon.icns
+          cp "$ICONSET/icon_512x512.png" apps/desktop/build/icon.png
+
+      - name: Import Apple Developer certificate
+        if: ${{ env.CSC_LINK != '' }}
+        env:
+          CSC_LINK: ${{ secrets.APPLE_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CSC_KEY_PASSWORD }}
+        run: |
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          echo "$CSC_LINK" | base64 --decode -o "$CERT_PATH"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASS=$(openssl rand -hex 16)
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$CSC_KEY_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: Build & publish macOS installer (arm64)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_LINK: ${{ secrets.APPLE_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CSC_KEY_PASSWORD }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          if [ -z "$CSC_LINK" ]; then
+            pnpm --filter @caliptic/desktop exec node scripts/package.mjs --mac --arm64 --publish always -c.mac.identity=null
+          else
+            pnpm --filter @caliptic/desktop exec node scripts/package.mjs --mac --arm64 --publish always
+          fi
+
+      - name: Build & publish macOS installer (x64)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_LINK: ${{ secrets.APPLE_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CSC_KEY_PASSWORD }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          if [ -z "$CSC_LINK" ]; then
+            pnpm --filter @caliptic/desktop exec node scripts/package.mjs --mac --x64 --publish always -c.mac.identity=null
+          else
+            pnpm --filter @caliptic/desktop exec node scripts/package.mjs --mac --x64 --publish always
+          fi
