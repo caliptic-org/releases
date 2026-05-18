@@ -1,0 +1,14 @@
+{
+  "license_id": "lic_test_dev_local",
+  "build_id":   "build_dev_$(date)",
+  "built_at":   "2026-05-19T00:00:00Z",
+  "endpoints": {
+    "api": "http://localhost:8080/api",
+    "ws":  "ws://localhost:8080/ws",
+    "web": "http://localhost:3000"
+  },
+  "branding": {
+    "name":  "Dev Workspace",
+    "color": "#FF6600"
+  }
+}

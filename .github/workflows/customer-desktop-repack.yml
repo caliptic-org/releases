@@ -1,0 +1,261 @@
+name: Customer Desktop Repack
+
+# Per-customer Caliptic Desktop installer build via ASAR repack of a
+# generic Caliptic-org/releases binary. Triggered by the Caliptic API
+# (workflow_dispatch from the portal `Build` button) after a customer
+# admin requests a custom-branded installer.
+#
+# Flow:
+#   1. Resolve generic build for the requested Caliptic version from
+#      caliptic-org/releases (latest .dmg / .exe).
+#   2. Extract, inject customer-config.json + icon, repack app.asar.
+#   3. Re-sign:
+#        - macOS: codesign with Developer ID, then notarize via Apple.
+#        - Windows: signtool with Caliptic Authenticode cert.
+#   4. Rebuild installer (.dmg via hdiutil, .exe via electron-builder
+#      re-pack in --prepackaged mode).
+#   5. Upload artifacts to Cloudflare R2 staging bucket (24h TTL).
+#   6. Callback to Caliptic API → portal flips status=ready → email user.
+#
+# No retention: R2 lifecycle policy auto-deletes after 24h.
+# Customer downloads from a portal-issued signed URL (1h TTL).
+#
+# Required secrets:
+#   PRIVATE_REPO_TOKEN        — fine-grained PAT for cross-repo source
+#   APPLE_CSC_LINK / KEY      — macOS signing certificate
+#   APPLE_ID / APP_SPECIFIC_PW / TEAM_ID — notarytool
+#   WIN_CSC_LINK / KEY        — Windows Authenticode cert
+#   R2_ACCOUNT_ID / ACCESS_KEY_ID / SECRET_ACCESS_KEY / BUCKET
+#   CALIPTIC_API_CALLBACK_HMAC — shared secret for callback auth
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: "Build ID from Caliptic portal"
+        required: true
+      license_id:
+        description: "License ID (informational; access already validated)"
+        required: true
+      caliptic_version:
+        description: "Caliptic version tag to repack (e.g. v0.1.42)"
+        required: true
+      platforms:
+        description: "Comma-separated: win,mac-arm64,mac-x64"
+        required: true
+        default: "win,mac-arm64,mac-x64"
+      callback_url:
+        description: "Caliptic API callback URL (e.g. https://app.caliptic.com/api/builds/{id}/artifacts)"
+        required: true
+      callback_token:
+        description: "Short-lived bearer token for callback auth"
+        required: true
+      customer_config_b64:
+        description: "Base64-encoded customer-config.json"
+        required: true
+
+# Permissions: read-only on this repo, no need for repo write.
+permissions:
+  contents: read
+
+jobs:
+  # ── Windows repack ────────────────────────────────────────────────
+  repack-windows:
+    if: contains(inputs.platforms, 'win')
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout pipeline scripts
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install script deps
+        run: npm install --no-save @electron/asar @aws-sdk/client-s3 plist
+
+      - name: Decode customer-config
+        shell: pwsh
+        run: |
+          $bytes = [Convert]::FromBase64String("${{ inputs.customer_config_b64 }}")
+          [IO.File]::WriteAllBytes("$pwd/customer-config.json", $bytes)
+          Write-Host "Decoded customer-config.json:"
+          Get-Content customer-config.json | Out-String
+
+      - name: Fetch generic Windows installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ inputs.caliptic_version }}" `
+            --repo caliptic-org/releases `
+            --pattern "caliptic-desktop-*-windows-*.exe" `
+            --dir ./generic
+          $exe = Get-ChildItem ./generic -Filter *.exe | Select -First 1
+          "GENERIC_EXE=$($exe.FullName)" | Out-File $env:GITHUB_ENV -Append
+          Write-Host "Generic installer: $($exe.FullName)"
+
+      - name: Extract installer (NSIS = 7z)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ./extracted | Out-Null
+          7z x -y -o./extracted "$env:GENERIC_EXE"
+
+      - name: Inject customer config
+        shell: pwsh
+        run: |
+          node ./scripts/customer-config-inject.mjs `
+            --bundle ./extracted `
+            --config ./customer-config.json `
+            --platform win
+
+      - name: Repackage as NSIS installer
+        shell: pwsh
+        env:
+          CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          # Use electron-builder's --prepackaged mode to wrap the
+          # already-modified `extracted/` directory in a fresh NSIS
+          # installer + sign with our Authenticode cert.
+          npx --yes electron-builder --prepackaged ./extracted `
+            --win nsis `
+            --config.win.signtoolOptions.signingHashAlgorithms=sha256 `
+            --config.directories.output=./dist
+
+      - name: Upload artifact to R2
+        env:
+          R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET:            ${{ secrets.R2_BUCKET }}
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem ./dist -Filter *.exe | Select -First 1
+          node ./scripts/r2-upload.mjs `
+            --build-id "${{ inputs.build_id }}" `
+            --platform "win" `
+            --file $installer.FullName `
+            --callback-url "${{ inputs.callback_url }}" `
+            --callback-token "${{ inputs.callback_token }}"
+
+  # ── macOS repack ──────────────────────────────────────────────────
+  repack-mac:
+    if: contains(inputs.platforms, 'mac-arm64') || contains(inputs.platforms, 'mac-x64')
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - arm64
+          - x64
+    steps:
+      - name: Skip if this arch wasn't requested
+        if: ${{ !contains(inputs.platforms, format('mac-{0}', matrix.arch)) }}
+        run: echo "mac-${{ matrix.arch }} not requested; skipping all subsequent steps" && exit 0
+
+      - name: Checkout pipeline scripts
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install script deps
+        run: npm install --no-save @electron/asar @aws-sdk/client-s3 plist
+
+      - name: Decode customer-config
+        run: |
+          echo "${{ inputs.customer_config_b64 }}" | base64 --decode > customer-config.json
+          echo "Decoded customer-config.json:"
+          cat customer-config.json
+
+      - name: Fetch generic macOS installer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ inputs.caliptic_version }}" \
+            --repo caliptic-org/releases \
+            --pattern "caliptic-desktop-*-mac-${{ matrix.arch }}.dmg" \
+            --dir ./generic
+          GENERIC_DMG=$(ls ./generic/*.dmg | head -1)
+          echo "GENERIC_DMG=$GENERIC_DMG" >> "$GITHUB_ENV"
+          echo "Generic installer: $GENERIC_DMG"
+
+      - name: Mount + extract .app
+        run: |
+          MOUNT_PT=$(mktemp -d)
+          hdiutil attach "$GENERIC_DMG" -mountpoint "$MOUNT_PT" -nobrowse -readonly
+          APP_NAME=$(ls "$MOUNT_PT" | grep '\.app$' | head -1)
+          mkdir -p ./work
+          cp -R "$MOUNT_PT/$APP_NAME" ./work/
+          hdiutil detach "$MOUNT_PT"
+          echo "APP_PATH=$(pwd)/work/$APP_NAME" >> "$GITHUB_ENV"
+
+      - name: Inject customer config
+        run: |
+          node ./scripts/customer-config-inject.mjs \
+            --bundle "$APP_PATH" \
+            --config ./customer-config.json \
+            --platform mac
+
+      - name: Import Apple Developer cert
+        env:
+          CSC_LINK: ${{ secrets.APPLE_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CSC_KEY_PASSWORD }}
+        run: |
+          CERT="$RUNNER_TEMP/cert.p12"
+          echo "$CSC_LINK" | base64 --decode -o "$CERT"
+          KC="$RUNNER_TEMP/build.keychain"
+          KC_PASS=$(openssl rand -hex 16)
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          security import "$CERT" -P "$CSC_KEY_PASSWORD" -A -t cert -f pkcs12 -k "$KC"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PASS" "$KC"
+          security list-keychain -d user -s "$KC"
+
+      - name: Codesign + notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | awk '{print $2}')
+          echo "Signing with: $IDENTITY"
+          codesign --force --deep --options runtime --sign "$IDENTITY" "$APP_PATH"
+
+          # Notarize
+          ZIP="$RUNNER_TEMP/notarize.zip"
+          ditto -c -k --keepParent "$APP_PATH" "$ZIP"
+          xcrun notarytool submit "$ZIP" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$APP_PATH"
+
+      - name: Re-pack into .dmg
+        run: |
+          mkdir -p ./dist
+          OUT_DMG="./dist/Caliptic-customer-${{ inputs.build_id }}-mac-${{ matrix.arch }}.dmg"
+          hdiutil create "$OUT_DMG" -srcfolder "$APP_PATH" -ov -format UDZO
+          echo "OUT_DMG=$OUT_DMG" >> "$GITHUB_ENV"
+
+      - name: Upload artifact to R2
+        env:
+          R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET:            ${{ secrets.R2_BUCKET }}
+        run: |
+          node ./scripts/r2-upload.mjs \
+            --build-id "${{ inputs.build_id }}" \
+            --platform "mac-${{ matrix.arch }}" \
+            --file "$OUT_DMG" \
+            --callback-url "${{ inputs.callback_url }}" \
+            --callback-token "${{ inputs.callback_token }}"
