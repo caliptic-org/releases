@@ -1,0 +1,209 @@
+# Caliptic CI — Read-Only Test Runner
+#
+# Lives on caliptic-org/releases so the source repo (caliptic-org/caliptic)
+# stays untouched. This workflow only READS — clones the source, runs
+# TypeScript typecheck + Vitest + Go tests against a Postgres service,
+# writes a results summary to the run page, and exits. It never pushes,
+# never opens PRs, never comments.
+#
+# Triggers:
+#   - workflow_dispatch        : run on demand (any ref)
+#   - schedule (06:00 UTC)     : nightly health check on main
+#   - repository_dispatch      : optional caliptic-side push hook
+#                                (event type "caliptic-main-push")
+#
+# What you see in the Actions tab:
+#   ✓ TypeScript typecheck (pnpm typecheck)
+#   ✓ TypeScript tests     (pnpm test)
+#   ✓ Go tests             (go test ./...)
+#   ─ Summary table        (per-suite pass/fail + timings)
+#
+# Required secrets:
+#   PRIVATE_REPO_TOKEN — fine-grained PAT with contents:read on
+#                        caliptic-org/caliptic (same secret the desktop
+#                        release workflow already uses).
+#
+# Cost note: nightly + on-demand only. No per-commit churn. If the team
+# wants per-push CI, register the caliptic-side dispatch hook below.
+
+name: Caliptic CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Branch / tag / SHA on caliptic-org/caliptic"
+        required: false
+        default: "main"
+      skip_e2e:
+        description: "Skip Playwright E2E (faster)"
+        required: false
+        type: boolean
+        default: true
+  schedule:
+    # Nightly at 06:00 UTC (09:00 İstanbul). Reports on whatever is on main.
+    - cron: "0 6 * * *"
+  repository_dispatch:
+    types: [caliptic-main-push]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: caliptic-ci-${{ github.event.inputs.source_ref || github.event.client_payload.ref || 'main' }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (ref=${{ github.event.inputs.source_ref || github.event.client_payload.ref || 'main' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: caliptic
+          POSTGRES_PASSWORD: caliptic
+          POSTGRES_DB: caliptic
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U caliptic -d caliptic"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      SOURCE_REF: ${{ github.event.inputs.source_ref || github.event.client_payload.ref || 'main' }}
+      DATABASE_URL: postgres://caliptic:caliptic@localhost:5432/caliptic?sslmode=disable
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: caliptic
+      POSTGRES_PASSWORD: caliptic
+      POSTGRES_DB: caliptic
+
+    steps:
+      - name: Checkout caliptic source (read-only)
+        uses: actions/checkout@v6
+        with:
+          repository: caliptic-org/caliptic
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          # Shallow is fine — no tag math, no version derivation in CI.
+          fetch-depth: 1
+
+      - name: Record source SHA
+        id: source
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          LONG_SHA=$(git rev-parse HEAD)
+          SUBJECT=$(git log -1 --pretty=%s | head -c 100)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "long_sha=$LONG_SHA" >> "$GITHUB_OUTPUT"
+          echo "subject=$SUBJECT" >> "$GITHUB_OUTPUT"
+          echo "::notice::Testing caliptic@${SHA} (${SUBJECT})"
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Go 1.26
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.1"
+          cache-dependency-path: server/go.sum
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ── TypeScript ─────────────────────────────────────────────────
+
+      - name: TypeScript typecheck
+        id: typecheck
+        continue-on-error: true
+        run: pnpm typecheck
+
+      - name: TypeScript tests (Vitest, all packages)
+        id: ts_tests
+        continue-on-error: true
+        run: pnpm test
+
+      # ── Go ─────────────────────────────────────────────────────────
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..30}; do
+            if pg_isready -h localhost -U caliptic >/dev/null 2>&1; then
+              echo "Postgres ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Postgres not ready"
+          exit 1
+
+      - name: Run database migrations
+        id: migrate
+        continue-on-error: true
+        working-directory: server
+        run: go run ./cmd/migrate up
+
+      - name: Go tests
+        id: go_tests
+        continue-on-error: true
+        working-directory: server
+        run: go test ./...
+
+      # ── Summary ────────────────────────────────────────────────────
+
+      - name: Write results summary
+        if: always()
+        env:
+          R_TYPECHECK: ${{ steps.typecheck.outcome }}
+          R_TS_TESTS: ${{ steps.ts_tests.outcome }}
+          R_MIGRATE: ${{ steps.migrate.outcome }}
+          R_GO_TESTS: ${{ steps.go_tests.outcome }}
+          SHA: ${{ steps.source.outputs.sha }}
+          LONG_SHA: ${{ steps.source.outputs.long_sha }}
+          SUBJECT: ${{ steps.source.outputs.subject }}
+        run: |
+          mark() { [ "$1" = "success" ] && echo "✅" || echo "❌"; }
+          {
+            echo "## Caliptic CI — \`${SOURCE_REF}\` @ \`${SHA}\`"
+            echo ""
+            echo "> ${SUBJECT}"
+            echo ""
+            echo "| Step | Result |"
+            echo "| --- | --- |"
+            echo "| TypeScript typecheck | $(mark "$R_TYPECHECK") $R_TYPECHECK |"
+            echo "| TypeScript tests | $(mark "$R_TS_TESTS") $R_TS_TESTS |"
+            echo "| DB migrate | $(mark "$R_MIGRATE") $R_MIGRATE |"
+            echo "| Go tests | $(mark "$R_GO_TESTS") $R_GO_TESTS |"
+            echo ""
+            echo "Source: [\`caliptic@${LONG_SHA}\`](https://github.com/caliptic-org/caliptic/commit/${LONG_SHA})"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail job if any step failed
+        if: always()
+        env:
+          R_TYPECHECK: ${{ steps.typecheck.outcome }}
+          R_TS_TESTS: ${{ steps.ts_tests.outcome }}
+          R_MIGRATE: ${{ steps.migrate.outcome }}
+          R_GO_TESTS: ${{ steps.go_tests.outcome }}
+        run: |
+          fail=0
+          for r in "$R_TYPECHECK" "$R_TS_TESTS" "$R_MIGRATE" "$R_GO_TESTS"; do
+            [ "$r" = "success" ] || fail=1
+          done
+          if [ "$fail" -eq 1 ]; then
+            echo "::error::One or more test suites failed — see summary above."
+            exit 1
+          fi
+          echo "All suites green."
