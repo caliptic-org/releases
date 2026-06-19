@@ -75,8 +75,7 @@ jobs:
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean --config ../.goreleaser.yml
-          workdir: server
+          args: release --clean --config .goreleaser.yml
         env:
           # GITHUB_TOKEN scoped to THIS public releases repo would be
           # enough since .goreleaser.yml targets owner/name=releases.
