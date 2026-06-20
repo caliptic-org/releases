@@ -63,17 +63,22 @@ jobs:
           Get-ChildItem "apps/desktop/build/icon-*.png" | Remove-Item -Force
 
       - name: Build Go binaries (caliptic-local + caliptic-server)
+        shell: bash
         run: |
           cd server
           go build -o ../apps/desktop/resources/bin/caliptic-local.exe ./cmd/caliptic-local
           go build -o ../apps/desktop/resources/bin/caliptic-server.exe ./cmd/server
 
       - name: Build and publish Windows installer
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
         run: |
           pnpm --filter @caliptic/desktop exec electron-vite build
-          pnpm --filter @caliptic/desktop exec electron-builder --win --x64 --config electron-builder-local.yml --publish always -c.extraMetadata.version=$(git describe --tags --always)
+          RAW=$(git describe --tags --always)
+          VERSION=$(echo "$RAW" | sed 's/^desktop-local-v//; s/^desktop-v//; s/^cli-v//; s/^server-v//; s/^v//')
+          echo "Version: $VERSION (from $RAW)"
+          pnpm --filter @caliptic/desktop exec electron-builder --win --x64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION"
 
   build-local-mac:
     name: Build Local Edition (macOS)
@@ -146,6 +151,14 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH"
 
+      - name: Derive version
+        id: version
+        run: |
+          RAW=$(git describe --tags --always)
+          VERSION=$(echo "$RAW" | sed 's/^desktop-local-v//; s/^desktop-v//; s/^cli-v//; s/^server-v//; s/^v//')
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION (from $RAW)"
+
       - name: Build Go binaries (arm64)
         run: |
           cd server
@@ -163,11 +176,11 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
           pnpm --filter @caliptic/desktop exec electron-vite build
-          VERSION=$(git describe --tags --always)
+          VERSION="${{ steps.version.outputs.value }}"
           if [ -z "$CSC_LINK" ]; then
-            pnpm --filter @caliptic/desktop exec electron-builder --mac --arm64 --config electron-builder-local.yml --publish always -c.extraMetadata.version=$VERSION -c.mac.identity=null
+            pnpm --filter @caliptic/desktop exec electron-builder --mac --arm64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION" -c.mac.identity=null
           else
-            pnpm --filter @caliptic/desktop exec electron-builder --mac --arm64 --config electron-builder-local.yml --publish always -c.extraMetadata.version=$VERSION
+            pnpm --filter @caliptic/desktop exec electron-builder --mac --arm64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION"
           fi
 
       - name: Build Go binaries (x64)
@@ -186,9 +199,9 @@ jobs:
           CSC_KEY_PASSWORD: ${{ secrets.APPLE_CSC_KEY_PASSWORD }}
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
-          VERSION=$(git describe --tags --always)
+          VERSION="${{ steps.version.outputs.value }}"
           if [ -z "$CSC_LINK" ]; then
-            pnpm --filter @caliptic/desktop exec electron-builder --mac --x64 --config electron-builder-local.yml --publish always -c.extraMetadata.version=$VERSION -c.mac.identity=null
+            pnpm --filter @caliptic/desktop exec electron-builder --mac --x64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION" -c.mac.identity=null
           else
-            pnpm --filter @caliptic/desktop exec electron-builder --mac --x64 --config electron-builder-local.yml --publish always -c.extraMetadata.version=$VERSION
+            pnpm --filter @caliptic/desktop exec electron-builder --mac --x64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION"
           fi
