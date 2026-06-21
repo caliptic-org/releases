@@ -66,8 +66,9 @@ jobs:
         shell: bash
         run: |
           cd server
-          go build -o ../apps/desktop/resources/bin/caliptic-local.exe ./cmd/caliptic-local
-          go build -o ../apps/desktop/resources/bin/caliptic-server.exe ./cmd/server
+          mkdir -p bin
+          go build -o bin/caliptic-local.exe ./cmd/caliptic-local
+          go build -o bin/caliptic-server.exe ./cmd/server
 
       - name: Build and publish Windows installer
         shell: bash
@@ -162,8 +163,9 @@ jobs:
       - name: Build Go binaries (arm64)
         run: |
           cd server
-          GOARCH=arm64 go build -o ../apps/desktop/resources/bin/caliptic-local ./cmd/caliptic-local
-          GOARCH=arm64 go build -o ../apps/desktop/resources/bin/caliptic-server ./cmd/server
+          mkdir -p bin
+          GOARCH=arm64 go build -o bin/caliptic-local ./cmd/caliptic-local
+          GOARCH=arm64 go build -o bin/caliptic-server ./cmd/server
 
       - name: Build and publish macOS installer (arm64)
         env:
@@ -186,8 +188,9 @@ jobs:
       - name: Build Go binaries (x64)
         run: |
           cd server
-          GOARCH=amd64 go build -o ../apps/desktop/resources/bin/caliptic-local ./cmd/caliptic-local
-          GOARCH=amd64 go build -o ../apps/desktop/resources/bin/caliptic-server ./cmd/server
+          rm -f bin/caliptic-local bin/caliptic-server
+          GOARCH=amd64 go build -o bin/caliptic-local ./cmd/caliptic-local
+          GOARCH=amd64 go build -o bin/caliptic-server ./cmd/server
 
       - name: Build and publish macOS installer (x64)
         env:
