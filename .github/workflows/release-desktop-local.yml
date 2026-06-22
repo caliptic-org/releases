@@ -62,13 +62,14 @@ jobs:
           magick convert -background none -size 512x512 "apps/desktop/build/icon.svg" "apps/desktop/build/icon.png"
           Get-ChildItem "apps/desktop/build/icon-*.png" | Remove-Item -Force
 
-      - name: Build Go binaries (caliptic-local + caliptic-server)
+      - name: Build Go binaries (caliptic-local + caliptic-server + caliptic CLI)
         shell: bash
         run: |
           cd server
           mkdir -p bin
           go build -o bin/caliptic-local.exe ./cmd/caliptic-local
           go build -o bin/caliptic-server.exe ./cmd/server
+          go build -o bin/caliptic.exe ./cmd/caliptic
 
       - name: Build and publish Windows installer
         shell: bash
@@ -166,6 +167,7 @@ jobs:
           mkdir -p bin
           GOARCH=arm64 go build -o bin/caliptic-local ./cmd/caliptic-local
           GOARCH=arm64 go build -o bin/caliptic-server ./cmd/server
+          GOARCH=arm64 go build -o bin/caliptic ./cmd/caliptic
 
       - name: Build and publish macOS installer (arm64)
         env:
@@ -188,9 +190,10 @@ jobs:
       - name: Build Go binaries (x64)
         run: |
           cd server
-          rm -f bin/caliptic-local bin/caliptic-server
+          rm -f bin/caliptic-local bin/caliptic-server bin/caliptic
           GOARCH=amd64 go build -o bin/caliptic-local ./cmd/caliptic-local
           GOARCH=amd64 go build -o bin/caliptic-server ./cmd/server
+          GOARCH=amd64 go build -o bin/caliptic ./cmd/caliptic
 
       - name: Build and publish macOS installer (x64)
         env:
