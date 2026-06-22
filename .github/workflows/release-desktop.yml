@@ -12,6 +12,12 @@ name: Release Desktop Apps
 # original `release-desktop.yml` env was `GH_TOKEN: RELEASES_TOKEN`,
 # which already targeted the public releases repo).
 #
+# Builds BOTH editions in a single run:
+#   - Normal Desktop (Caliptic) — uses scripts/package.mjs
+#   - Local Edition (Caliptic Local) — builds Go binaries + electron-builder-local.yml
+# Artifact names don't conflict (caliptic-desktop-* vs caliptic-local-*),
+# so all 6 jobs publish to the same GitHub Release.
+#
 # Manual trigger:
 #   GitHub UI → Actions → Release Desktop Apps → "Run workflow"
 # Pre-requisite: a semver tag (e.g. v0.1.40) must exist in the source
@@ -249,3 +255,294 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
         run: |
           pnpm --filter @caliptic/desktop exec node scripts/package.mjs --linux --arm64 --publish always
+
+  # ══════════════════════════════════════════════════════════════════════
+  # LOCAL EDITION — embedded PostgreSQL + caliptic-server + daemon
+  # Artifact names use caliptic-local-* prefix (no conflict with normal).
+  # ══════════════════════════════════════════════════════════════════════
+
+  # ── Local Windows ──────────────────────────────────────────────────────
+  build-local-windows:
+    name: Build Local Edition (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v6
+        with:
+          repository: caliptic-org/caliptic
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          fetch-depth: 0
+
+      - name: Reset working tree
+        run: git checkout -- .
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Windows icons from SVG
+        shell: pwsh
+        run: |
+          $sizes = @(16,24,32,48,64,128,256)
+          $pngs  = @()
+          foreach ($s in $sizes) {
+            $out = "apps/desktop/build/icon-${s}.png"
+            magick convert -background none -size "${s}x${s}" "apps/desktop/build/icon.svg" $out
+            $pngs += $out
+          }
+          $a  = ($pngs -join " ") + " apps/desktop/build/icon.ico"
+          Invoke-Expression "magick convert $a"
+          magick convert -background none -size 512x512 "apps/desktop/build/icon.svg" "apps/desktop/build/icon.png"
+          Get-ChildItem "apps/desktop/build/icon-*.png" | Remove-Item -Force
+
+      - name: Build Go binaries (caliptic-local + caliptic-server + caliptic CLI)
+        shell: bash
+        run: |
+          cd server
+          mkdir -p bin
+          go build -o bin/caliptic-local.exe ./cmd/caliptic-local
+          go build -o bin/caliptic-server.exe ./cmd/server
+          go build -o bin/caliptic.exe ./cmd/caliptic
+
+      - name: Build and publish Windows installer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          pnpm --filter @caliptic/desktop exec electron-vite build
+          RAW=$(git describe --tags --always)
+          VERSION=$(echo "$RAW" | sed 's/^desktop-local-v//; s/^desktop-v//; s/^cli-v//; s/^server-v//; s/^v//')
+          echo "Version: $VERSION (from $RAW)"
+          pnpm --filter @caliptic/desktop exec electron-builder --win --x64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION"
+
+  # ── Local macOS ────────────────────────────────────────────────────────
+  build-local-mac:
+    name: Build Local Edition (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v6
+        with:
+          repository: caliptic-org/caliptic
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          fetch-depth: 0
+
+      - name: Reset working tree
+        run: git checkout -- .
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install librsvg for SVG to PNG conversion
+        run: brew install librsvg
+
+      - name: Generate macOS icons from SVG
+        run: |
+          SVG="apps/desktop/build/icon.svg"
+          ICONSET=$(mktemp -d)/icon.iconset
+          mkdir -p "$ICONSET"
+          for SIZE in 16 32 64 128 256 512 1024; do
+            rsvg-convert -w $SIZE -h $SIZE "$SVG" -o "$ICONSET/icon_${SIZE}x${SIZE}.png"
+          done
+          cp "$ICONSET/icon_32x32.png"   "$ICONSET/icon_16x16@2x.png"
+          cp "$ICONSET/icon_64x64.png"   "$ICONSET/icon_32x32@2x.png"
+          cp "$ICONSET/icon_256x256.png" "$ICONSET/icon_128x128@2x.png"
+          cp "$ICONSET/icon_512x512.png" "$ICONSET/icon_256x256@2x.png"
+          cp "$ICONSET/icon_1024x1024.png" "$ICONSET/icon_512x512@2x.png"
+          iconutil -c icns "$ICONSET" -o apps/desktop/build/icon.icns
+          cp "$ICONSET/icon_512x512.png" apps/desktop/build/icon.png
+
+      - name: Import Apple Developer certificate
+        if: ${{ env.CSC_LINK != '' }}
+        env:
+          CSC_LINK: ${{ secrets.APPLE_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CSC_KEY_PASSWORD }}
+        run: |
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          echo "$CSC_LINK" | base64 --decode -o "$CERT_PATH"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASS=$(openssl rand -hex 16)
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$CSC_KEY_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: Derive version
+        id: version
+        run: |
+          RAW=$(git describe --tags --always)
+          VERSION=$(echo "$RAW" | sed 's/^desktop-local-v//; s/^desktop-v//; s/^cli-v//; s/^server-v//; s/^v//')
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION (from $RAW)"
+
+      - name: Build Go binaries (arm64)
+        run: |
+          cd server
+          mkdir -p bin
+          GOARCH=arm64 go build -o bin/caliptic-local ./cmd/caliptic-local
+          GOARCH=arm64 go build -o bin/caliptic-server ./cmd/server
+          GOARCH=arm64 go build -o bin/caliptic ./cmd/caliptic
+
+      - name: Build and publish macOS installer (arm64)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_LINK: ${{ secrets.APPLE_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CSC_KEY_PASSWORD }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          pnpm --filter @caliptic/desktop exec electron-vite build
+          VERSION="${{ steps.version.outputs.value }}"
+          if [ -z "$CSC_LINK" ]; then
+            pnpm --filter @caliptic/desktop exec electron-builder --mac --arm64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION" -c.mac.identity=null
+          else
+            pnpm --filter @caliptic/desktop exec electron-builder --mac --arm64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION"
+          fi
+
+      - name: Build Go binaries (x64)
+        run: |
+          cd server
+          rm -f bin/caliptic-local bin/caliptic-server bin/caliptic
+          GOARCH=amd64 go build -o bin/caliptic-local ./cmd/caliptic-local
+          GOARCH=amd64 go build -o bin/caliptic-server ./cmd/server
+          GOARCH=amd64 go build -o bin/caliptic ./cmd/caliptic
+
+      - name: Build and publish macOS installer (x64)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_LINK: ${{ secrets.APPLE_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CSC_KEY_PASSWORD }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          VERSION="${{ steps.version.outputs.value }}"
+          if [ -z "$CSC_LINK" ]; then
+            pnpm --filter @caliptic/desktop exec electron-builder --mac --x64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION" -c.mac.identity=null
+          else
+            pnpm --filter @caliptic/desktop exec electron-builder --mac --x64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION"
+          fi
+
+  # ── Local Linux ────────────────────────────────────────────────────────
+  build-local-linux:
+    name: Build Local Edition (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v6
+        with:
+          repository: caliptic-org/caliptic
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          fetch-depth: 0
+
+      - name: Reset working tree
+        run: git checkout -- .
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y librsvg2-bin rpm
+
+      - name: Generate Linux icon from SVG
+        run: |
+          rsvg-convert -w 512 -h 512 apps/desktop/build/icon.svg -o apps/desktop/build/icon.png
+
+      - name: Derive version
+        id: version
+        run: |
+          RAW=$(git describe --tags --always)
+          VERSION=$(echo "$RAW" | sed 's/^desktop-local-v//; s/^desktop-v//; s/^cli-v//; s/^server-v//; s/^v//')
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION (from $RAW)"
+
+      - name: Build Go binaries (x64)
+        run: |
+          cd server
+          mkdir -p bin
+          GOARCH=amd64 go build -o bin/caliptic-local ./cmd/caliptic-local
+          GOARCH=amd64 go build -o bin/caliptic-server ./cmd/server
+          GOARCH=amd64 go build -o bin/caliptic ./cmd/caliptic
+
+      - name: Build and publish Linux packages (x64)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          pnpm --filter @caliptic/desktop exec electron-vite build
+          VERSION="${{ steps.version.outputs.value }}"
+          pnpm --filter @caliptic/desktop exec electron-builder --linux --x64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION"
+
+      - name: Build Go binaries (arm64)
+        run: |
+          cd server
+          rm -f bin/caliptic-local bin/caliptic-server bin/caliptic
+          GOARCH=arm64 go build -o bin/caliptic-local ./cmd/caliptic-local
+          GOARCH=arm64 go build -o bin/caliptic-server ./cmd/server
+          GOARCH=arm64 go build -o bin/caliptic ./cmd/caliptic
+
+      - name: Build and publish Linux packages (arm64)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.value }}"
+          pnpm --filter @caliptic/desktop exec electron-builder --linux --arm64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION"
