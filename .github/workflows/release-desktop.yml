@@ -71,6 +71,20 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Clean stale release manifests
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          for MANIFEST in latest.yml latest-arm64.yml; do
+            ASSET_ID=$(gh api repos/caliptic-org/releases/releases --jq ".[0].assets[] | select(.name==\"$MANIFEST\") | .id" 2>/dev/null || echo "")
+            if [ -n "$ASSET_ID" ]; then
+              echo "Deleting stale $MANIFEST (asset $ASSET_ID)"
+              gh api -X DELETE "repos/caliptic-org/releases/releases/assets/$ASSET_ID" || true
+            fi
+          done
+          sleep 3
+
       - name: Generate Windows icons from SVG
         shell: pwsh
         run: |
@@ -164,6 +178,17 @@ jobs:
           security import "$CERT_PATH" -P "$CSC_KEY_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: Clean stale release manifests
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          ASSET_ID=$(gh api repos/caliptic-org/releases/releases --jq '.[0].assets[] | select(.name=="latest-mac.yml") | .id' 2>/dev/null || echo "")
+          if [ -n "$ASSET_ID" ]; then
+            echo "Deleting stale latest-mac.yml (asset $ASSET_ID)"
+            gh api -X DELETE "repos/caliptic-org/releases/releases/assets/$ASSET_ID" || true
+            sleep 3
+          fi
 
       - name: Build & publish macOS installer (arm64)
         env:
@@ -260,11 +285,35 @@ jobs:
         run: |
           rsvg-convert -w 512 -h 512 apps/desktop/build/icon.svg -o apps/desktop/build/icon.png
 
+      - name: Clean stale release manifests
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          for MANIFEST in latest-linux.yml latest-linux-arm64.yml; do
+            ASSET_ID=$(gh api repos/caliptic-org/releases/releases --jq ".[0].assets[] | select(.name==\"$MANIFEST\") | .id" 2>/dev/null || echo "")
+            if [ -n "$ASSET_ID" ]; then
+              echo "Deleting stale $MANIFEST (asset $ASSET_ID)"
+              gh api -X DELETE "repos/caliptic-org/releases/releases/assets/$ASSET_ID" || true
+            fi
+          done
+          sleep 3
+
       - name: Build & publish Linux packages (x64)
         env:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
         run: |
           pnpm --filter @caliptic/desktop exec node scripts/package.mjs --linux --x64 --publish always
+
+      - name: Pre-delete auto-update manifest (avoid overwrite race)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          ASSET_ID=$(gh api repos/caliptic-org/releases/releases --jq '.[0].assets[] | select(.name=="latest-linux.yml") | .id' 2>/dev/null || echo "")
+          if [ -n "$ASSET_ID" ]; then
+            echo "Deleting latest-linux.yml (asset $ASSET_ID) before arm64 build"
+            gh api -X DELETE "repos/caliptic-org/releases/releases/assets/$ASSET_ID" || true
+            sleep 5
+          fi
 
       - name: Build & publish Linux packages (arm64)
         env:
@@ -312,6 +361,20 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Clean stale release manifests
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          for MANIFEST in local.yml local-arm64.yml; do
+            ASSET_ID=$(gh api repos/caliptic-org/releases/releases --jq ".[0].assets[] | select(.name==\"$MANIFEST\") | .id" 2>/dev/null || echo "")
+            if [ -n "$ASSET_ID" ]; then
+              echo "Deleting stale $MANIFEST (asset $ASSET_ID)"
+              gh api -X DELETE "repos/caliptic-org/releases/releases/assets/$ASSET_ID" || true
+            fi
+          done
+          sleep 3
 
       - name: Generate Windows icons from SVG
         shell: pwsh
@@ -427,6 +490,17 @@ jobs:
           VERSION=$(echo "$RAW" | sed 's/^desktop-local-v//; s/^desktop-v//; s/^cli-v//; s/^server-v//; s/^v//')
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $VERSION (from $RAW)"
+
+      - name: Clean stale release manifests
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          ASSET_ID=$(gh api repos/caliptic-org/releases/releases --jq '.[0].assets[] | select(.name=="local-mac.yml") | .id' 2>/dev/null || echo "")
+          if [ -n "$ASSET_ID" ]; then
+            echo "Deleting stale local-mac.yml (asset $ASSET_ID)"
+            gh api -X DELETE "repos/caliptic-org/releases/releases/assets/$ASSET_ID" || true
+            sleep 3
+          fi
 
       - name: Build Go binaries (arm64)
         run: |
@@ -551,6 +625,19 @@ jobs:
           GOARCH=amd64 go build -o bin/caliptic-server ./cmd/server
           GOARCH=amd64 go build -o bin/caliptic ./cmd/caliptic
 
+      - name: Clean stale release manifests
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          for MANIFEST in local-linux.yml local-linux-arm64.yml; do
+            ASSET_ID=$(gh api repos/caliptic-org/releases/releases --jq ".[0].assets[] | select(.name==\"$MANIFEST\") | .id" 2>/dev/null || echo "")
+            if [ -n "$ASSET_ID" ]; then
+              echo "Deleting stale $MANIFEST (asset $ASSET_ID)"
+              gh api -X DELETE "repos/caliptic-org/releases/releases/assets/$ASSET_ID" || true
+            fi
+          done
+          sleep 3
+
       - name: Build and publish Linux packages (x64)
         env:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
@@ -558,6 +645,17 @@ jobs:
           pnpm --filter @caliptic/desktop exec electron-vite build
           VERSION="${{ steps.version.outputs.value }}"
           pnpm --filter @caliptic/desktop exec electron-builder --linux --x64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION"
+
+      - name: Pre-delete auto-update manifest (avoid overwrite race)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          ASSET_ID=$(gh api repos/caliptic-org/releases/releases --jq '.[0].assets[] | select(.name=="local-linux.yml") | .id' 2>/dev/null || echo "")
+          if [ -n "$ASSET_ID" ]; then
+            echo "Deleting local-linux.yml (asset $ASSET_ID) before arm64 build"
+            gh api -X DELETE "repos/caliptic-org/releases/releases/assets/$ASSET_ID" || true
+            sleep 5
+          fi
 
       - name: Build Go binaries (arm64)
         run: |
