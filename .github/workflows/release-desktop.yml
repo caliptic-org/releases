@@ -190,3 +190,62 @@ jobs:
           else
             pnpm --filter @caliptic/desktop exec node scripts/package.mjs --mac --x64 --publish always
           fi
+
+  # ── Linux ───────────────────────────────────────────────────────────────────
+  # Runs in PARALLEL with Windows and macOS (no `needs:` link).
+  # No code signing needed for Linux.
+  build-desktop-linux:
+    name: Build Desktop (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v6
+        with:
+          repository: caliptic-org/caliptic
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          fetch-depth: 0
+
+      - name: Reset working tree
+        run: git checkout -- .
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y librsvg2-bin rpm
+
+      - name: Generate Linux icon from SVG
+        run: |
+          rsvg-convert -w 512 -h 512 apps/desktop/build/icon.svg -o apps/desktop/build/icon.png
+
+      - name: Build & publish Linux packages (x64)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          pnpm --filter @caliptic/desktop exec node scripts/package.mjs --linux --x64 --publish always
+
+      - name: Build & publish Linux packages (arm64)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          pnpm --filter @caliptic/desktop exec node scripts/package.mjs --linux --arm64 --publish always
