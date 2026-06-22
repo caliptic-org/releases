@@ -181,6 +181,22 @@ jobs:
             pnpm --filter @caliptic/desktop exec node scripts/package.mjs --mac --arm64 --publish always
           fi
 
+      # electron-builder's overwrite logic (delete + re-upload) races on
+      # GitHub's API — the DELETE returns 204 but the asset name stays
+      # reserved briefly, causing the next POST to 422. Pre-deleting with
+      # a sleep gives the API time to converge before the x64 build uploads
+      # a merged manifest covering both arches.
+      - name: Pre-delete auto-update manifest (avoid overwrite race)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          ASSET_ID=$(gh api repos/caliptic-org/releases/releases --jq '.[0].assets[] | select(.name=="latest-mac.yml") | .id' 2>/dev/null || echo "")
+          if [ -n "$ASSET_ID" ]; then
+            echo "Deleting latest-mac.yml (asset $ASSET_ID) before x64 build"
+            gh api -X DELETE "repos/caliptic-org/releases/releases/assets/$ASSET_ID" || true
+            sleep 5
+          fi
+
       - name: Build & publish macOS installer (x64)
         env:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
@@ -445,6 +461,17 @@ jobs:
           GOARCH=amd64 go build -o bin/caliptic-local ./cmd/caliptic-local
           GOARCH=amd64 go build -o bin/caliptic-server ./cmd/server
           GOARCH=amd64 go build -o bin/caliptic ./cmd/caliptic
+
+      - name: Pre-delete auto-update manifest (avoid overwrite race)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          ASSET_ID=$(gh api repos/caliptic-org/releases/releases --jq '.[0].assets[] | select(.name=="local-mac.yml") | .id' 2>/dev/null || echo "")
+          if [ -n "$ASSET_ID" ]; then
+            echo "Deleting local-mac.yml (asset $ASSET_ID) before x64 build"
+            gh api -X DELETE "repos/caliptic-org/releases/releases/assets/$ASSET_ID" || true
+            sleep 5
+          fi
 
       - name: Build and publish macOS installer (x64)
         env:
