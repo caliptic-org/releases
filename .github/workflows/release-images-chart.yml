@@ -1,0 +1,278 @@
+name: Release Images and Chart
+
+# Publishes one product version from the PUBLIC `caliptic-org/releases`
+# repo: the container images (backend, web, daemon) and the Helm chart that
+# installs them. It runs here, not in the private `caliptic-org/caliptic`
+# repo, to use the free Actions minutes of a public repository. The source
+# is checked out from the private repo with the `PRIVATE_REPO_TOKEN` secret.
+#
+# Before running, in the private repo:
+#   node scripts/set-version.mjs <version>   # package.json files + Chart.yaml
+#   git commit, git tag v<version>, git push origin main v<version>
+#
+# Manual trigger:
+#   GitHub UI → Actions → Release Images and Chart → "Run workflow" → tag
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag in the private repo to release (e.g. v0.2.0). Must match Chart.yaml."
+        required: true
+      latest:
+        description: "Also move the `latest` image tag"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
+  CHART: deploy/helm/caliptic
+
+jobs:
+  check:
+    name: Check version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      commit: ${{ steps.commit.outputs.sha }}
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: caliptic-org/caliptic
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - name: Tag matches the recorded version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          chart_version="$(sed -n 's/^version: //p' "$CHART/Chart.yaml")"
+          app_version="$(sed -n 's/^appVersion: "\(.*\)"/\1/p' "$CHART/Chart.yaml")"
+          pkg_version="$(node -p "require('./package.json').version")"
+          fail=0
+          [ "$chart_version" = "$version" ] || { echo "Chart.yaml version is $chart_version, expected $version"; fail=1; }
+          [ "$app_version" = "$TAG" ] || { echo "Chart.yaml appVersion is $app_version, expected $TAG"; fail=1; }
+          [ "$pkg_version" = "$version" ] || { echo "package.json version is $pkg_version, expected $version"; fail=1; }
+          if [ "$fail" = 1 ]; then
+            echo "Run: node scripts/set-version.mjs $version — then commit and re-tag."
+            exit 1
+          fi
+
+      - name: Record source commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  chart-validate:
+    name: Lint and render chart
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: caliptic-org/caliptic
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Install kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | tar -xz -C /usr/local/bin kubeconform
+
+      - name: Lint
+        run: helm lint "$CHART" -f "$CHART/ci/test-values.yaml"
+
+      - name: Render every profile and validate against Kubernetes schemas
+        run: |
+          set -euo pipefail
+          render() {
+            name="$1"; shift
+            helm template caliptic "$CHART" -f "$CHART/ci/test-values.yaml" "$@" > "/tmp/$name.yaml"
+            kubeconform -strict -summary -ignore-missing-schemas -kubernetes-version 1.30.0 "/tmp/$name.yaml"
+          }
+          render defaults
+          render onprem -f "$CHART/values-onprem.yaml"
+          render openshift -f "$CHART/values-openshift.yaml"
+          render ha -f "$CHART/values-ha.yaml"
+          render everything -f "$CHART/values-onprem.yaml" \
+            --set redis.enabled=true \
+            --set daemon.enabled=true --set daemon.token=ci-token \
+            --set cloudRuntime.enabled=true \
+            --set license.key=ci.license.token \
+            --set resourceQuota.enabled=true --set limitRange.enabled=true \
+            --set backend.replicaCount=2 --set backend.uploads.accessMode=ReadWriteMany
+
+      - name: Unsafe configurations are rejected
+        run: |
+          set -uo pipefail
+          reject() {
+            if helm template caliptic "$CHART" "$@" > /dev/null 2>&1; then
+              echo "expected rendering to fail for: $*"; exit 1
+            fi
+          }
+          reject
+          reject --set publicUrl=https://x.example.com --set postgres.auth.password=p
+          reject --set publicUrl=https://x.example.com --set postgres.auth.password=p \
+            --set backend.jwtSecret=change-me-in-production
+          reject -f "$CHART/ci/test-values.yaml" --set backend.replicaCount=2
+
+  build:
+    name: Build ${{ matrix.image }}
+    needs: [check, chart-validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: caliptic-backend
+            dockerfile: Dockerfile
+          - image: caliptic-web
+            dockerfile: Dockerfile.web
+          - image: caliptic-daemon
+            dockerfile: Dockerfile.daemon
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: caliptic-org/caliptic
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tags
+        id: tags
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          TAGS="${IMAGE_PREFIX}/${{ matrix.image }}:${TAG}"
+          if [ "${{ inputs.latest }}" = "true" ]; then
+            TAGS="${TAGS},${IMAGE_PREFIX}/${{ matrix.image }}:latest"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            VERSION=${{ inputs.tag }}
+            COMMIT=${{ needs.check.outputs.commit }}
+            NEXT_PUBLIC_APP_VERSION=${{ inputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  selfhost-smoke:
+    name: Self-host smoke test
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CALIPTIC_IMAGE_TAG: ${{ inputs.tag }}
+      CALIPTIC_BACKEND_IMAGE: ghcr.io/${{ github.repository_owner }}/caliptic-backend
+      CALIPTIC_WEB_IMAGE: ghcr.io/${{ github.repository_owner }}/caliptic-web
+      POSTGRES_PASSWORD: smoke-test-password
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: caliptic-org/caliptic
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start the stack
+        run: |
+          export JWT_SECRET="$(openssl rand -hex 32)"
+          docker compose -f docker-compose.selfhost.yml up -d
+
+      - name: Wait for backend and web
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8080/health >/dev/null \
+              && curl -sf http://localhost:3000/api/config >/dev/null; then
+              echo "stack is up"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "stack did not become healthy"
+          exit 1
+
+      - name: Web proxies API and auth routes to the backend
+        run: |
+          curl -sf http://localhost:3000/api/config | grep -q '"allow_signup"'
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:3000/auth/send-code \
+            -H 'content-type: application/json' -d '{"email":"smoke@example.com"}')
+          test "$code" = "200"
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.selfhost.yml logs --tail=200
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose -f docker-compose.selfhost.yml down -v
+
+  chart-publish:
+    name: Publish chart
+    needs: selfhost-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: caliptic-org/caliptic
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Package
+        env:
+          TAG: ${{ inputs.tag }}
+        run: helm package "$CHART" --destination /tmp/chart --app-version "$TAG"
+
+      - name: Push to GHCR
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          helm push /tmp/chart/caliptic-*.tgz "oci://ghcr.io/${{ github.repository_owner }}/charts"
