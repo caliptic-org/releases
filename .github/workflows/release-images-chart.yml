@@ -217,7 +217,10 @@ jobs:
 
       - name: Start the stack
         run: |
+          # Exported through GITHUB_ENV so the log and teardown steps can
+          # interpolate the compose file too.
           export JWT_SECRET="$(openssl rand -hex 32)"
+          echo "JWT_SECRET=$JWT_SECRET" >> "$GITHUB_ENV"
           docker compose -f docker-compose.selfhost.yml up -d
 
       - name: Wait for backend and web
@@ -235,10 +238,13 @@ jobs:
 
       - name: Web proxies API and auth routes to the backend
         run: |
-          curl -sf http://localhost:3000/api/config | grep -q '"allow_signup"'
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:3000/auth/send-code \
+          config=$(curl -s -w '\n%{http_code}' http://localhost:3000/api/config)
+          echo "GET /api/config -> $config"
+          echo "$config" | grep -q '"allow_signup"'
+          resp=$(curl -s -w '\n%{http_code}' -X POST http://localhost:3000/auth/send-code \
             -H 'content-type: application/json' -d '{"email":"smoke@example.com"}')
-          test "$code" = "200"
+          echo "POST /auth/send-code -> $resp"
+          test "$(echo "$resp" | tail -n1)" = "200"
 
       - name: Logs on failure
         if: failure()
