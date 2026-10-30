@@ -284,10 +284,42 @@ jobs:
           cp scripts/install.sh scripts/install.ps1 docker-compose.selfhost.yml /tmp/selfhost/
           cp deploy/selfhost.env.example /tmp/selfhost/selfhost.env.example
           # The CLI and desktop workflows publish to the same release; whichever
-          # runs first creates it.
+          # runs first creates it, never as latest.
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Caliptic $TAG"
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Caliptic $TAG" --latest=false \
+            || gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
           gh release upload "$TAG" /tmp/selfhost/* --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Mark as latest when complete
+        # install.sh and the download page follow /releases/latest, so the
+        # release becomes latest only when the installers, the CLI, the
+        # desktop apps and the images are all published. The last workflow
+        # to finish does it.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          v="${TAG#v}"
+          need="install.sh install.ps1 docker-compose.selfhost.yml selfhost.env.example
+            caliptic-cli-$v-linux-amd64.tar.gz caliptic-cli-$v-darwin-arm64.tar.gz caliptic-cli-$v-windows-amd64.zip
+            caliptic-desktop-$v-mac-arm64.dmg caliptic-desktop-$v-windows-x64.exe caliptic-desktop-$v-linux-x86_64.AppImage
+            caliptic-local-$v-mac-arm64.dmg caliptic-local-$v-windows-x64.exe caliptic-local-$v-linux-x86_64.AppImage"
+          have=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          missing=""
+          for f in $need; do
+            grep -qxF "$f" <<<"$have" || missing="$missing $f"
+          done
+          for img in caliptic-backend caliptic-web caliptic-daemon; do
+            docker manifest inspect "ghcr.io/$OWNER/$img:$TAG" >/dev/null 2>&1 || missing="$missing $img:$TAG"
+          done
+          if [ -n "$missing" ]; then
+            echo "$TAG is not complete yet; missing:$missing"
+            exit 0
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --latest
+          echo "$TAG is complete and is now the latest release"
 
   chart-publish:
     name: Publish chart

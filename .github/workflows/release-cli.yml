@@ -70,6 +70,18 @@ jobs:
       - name: Run Go tests
         run: cd server && go test ./...
 
+      - name: Create the release without making it latest
+        # The CLI, desktop and images workflows publish to the same release.
+        # Whichever runs first creates it, never as latest; "Mark as latest
+        # when complete" flips it once everything is uploaded.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Caliptic $TAG" --latest=false \
+            || gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
@@ -84,3 +96,34 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASES_TOKEN }}
           RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN }}
           GORELEASER_CURRENT_TAG: ${{ steps.ver.outputs.tag }}
+
+      - name: Mark as latest when complete
+        # install.sh and the download page follow /releases/latest, so the
+        # release becomes latest only when the installers, the CLI, the
+        # desktop apps and the images are all published. The last workflow
+        # to finish does it.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          v="${TAG#v}"
+          need="install.sh install.ps1 docker-compose.selfhost.yml selfhost.env.example
+            caliptic-cli-$v-linux-amd64.tar.gz caliptic-cli-$v-darwin-arm64.tar.gz caliptic-cli-$v-windows-amd64.zip
+            caliptic-desktop-$v-mac-arm64.dmg caliptic-desktop-$v-windows-x64.exe caliptic-desktop-$v-linux-x86_64.AppImage
+            caliptic-local-$v-mac-arm64.dmg caliptic-local-$v-windows-x64.exe caliptic-local-$v-linux-x86_64.AppImage"
+          have=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          missing=""
+          for f in $need; do
+            grep -qxF "$f" <<<"$have" || missing="$missing $f"
+          done
+          for img in caliptic-backend caliptic-web caliptic-daemon; do
+            docker manifest inspect "ghcr.io/$OWNER/$img:$TAG" >/dev/null 2>&1 || missing="$missing $img:$TAG"
+          done
+          if [ -n "$missing" ]; then
+            echo "$TAG is not complete yet; missing:$missing"
+            exit 0
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --latest
+          echo "$TAG is complete and is now the latest release"
