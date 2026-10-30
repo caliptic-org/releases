@@ -1,8 +1,10 @@
 name: Release Images and Chart
 
 # Publishes one product version from the PUBLIC `caliptic-org/releases`
-# repo: the container images (backend, web, daemon) and the Helm chart that
-# installs them. It runs here, not in the private `caliptic-org/caliptic`
+# repo: the container images (backend, web, daemon), the Helm chart that
+# installs them, and the self-host files customers download from the GitHub
+# release (install.sh, install.ps1, docker-compose.selfhost.yml,
+# selfhost.env.example). It runs here, not in the private `caliptic-org/caliptic`
 # repo, to use the free Actions minutes of a public repository. The source
 # is checked out from the private repo with the `PRIVATE_REPO_TOKEN` secret.
 #
@@ -221,6 +223,8 @@ jobs:
           # interpolate the compose file too.
           export JWT_SECRET="$(openssl rand -hex 32)"
           echo "JWT_SECRET=$JWT_SECRET" >> "$GITHUB_ENV"
+          # The env template customers download; the exported values win.
+          cp deploy/selfhost.env.example .env
           docker compose -f docker-compose.selfhost.yml up -d
 
       - name: Wait for backend and web
@@ -253,6 +257,37 @@ jobs:
       - name: Stop the stack
         if: always()
         run: docker compose -f docker-compose.selfhost.yml down -v
+
+  selfhost-files:
+    name: Publish self-host files
+    needs: selfhost-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # GitHub Release on this repo
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: caliptic-org/caliptic
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/selfhost
+          cp scripts/install.sh scripts/install.ps1 docker-compose.selfhost.yml /tmp/selfhost/
+          cp deploy/selfhost.env.example /tmp/selfhost/selfhost.env.example
+          # The CLI and desktop workflows publish to the same release; whichever
+          # runs first creates it.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Caliptic $TAG"
+          gh release upload "$TAG" /tmp/selfhost/* --repo "$GITHUB_REPOSITORY" --clobber
 
   chart-publish:
     name: Publish chart
