@@ -30,6 +30,12 @@ on:
         description: "Branch/ref in the private repo to build from. Defaults to release."
         required: false
         default: "release"
+      platforms:
+        description: "Which builds to run: all, or macos to redo only the macOS jobs of a release."
+        required: false
+        default: "all"
+        type: choice
+        options: [all, macos]
 
 permissions:
   contents: write   # write GitHub Releases on THIS public repo
@@ -56,6 +62,7 @@ jobs:
   build-desktop-windows:
     name: Build Desktop (Windows)
     needs: prepare-release
+    if: ${{ inputs.platforms != 'macos' }}
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -163,6 +170,16 @@ jobs:
           security import "$CERT_PATH" -P "$CSC_KEY_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH"
+          # Sign from this keychain: with CSC_LINK set, electron-builder makes
+          # a second temporary keychain, and its set-key-partition-list fails
+          # on the macos-26 runner image of 2026-11-12.
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | sed -nE 's/.*"Developer ID Application: (.*)"$/\1/p' | head -1)
+          if [ -z "$IDENTITY" ]; then
+            echo "No Developer ID Application identity in the certificate" >&2
+            exit 1
+          fi
+          echo "CSC_NAME=$IDENTITY" >> "$GITHUB_ENV"
+          echo "CSC_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
       - name: Clean stale release manifests
         env:
@@ -181,11 +198,9 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          CSC_LINK: ${{ secrets.APPLE_CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CSC_KEY_PASSWORD }}
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
-          if [ -z "$CSC_LINK" ]; then
+          if [ -z "${CSC_NAME:-}" ]; then
             pnpm --filter @caliptic/desktop exec node scripts/package.mjs --mac --arm64 --publish always -c.mac.identity=null
           else
             pnpm --filter @caliptic/desktop exec node scripts/package.mjs --mac --arm64 --publish always
@@ -213,11 +228,9 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          CSC_LINK: ${{ secrets.APPLE_CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CSC_KEY_PASSWORD }}
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
-          if [ -z "$CSC_LINK" ]; then
+          if [ -z "${CSC_NAME:-}" ]; then
             pnpm --filter @caliptic/desktop exec node scripts/package.mjs --mac --x64 --publish always -c.mac.identity=null
           else
             pnpm --filter @caliptic/desktop exec node scripts/package.mjs --mac --x64 --publish always
@@ -229,6 +242,7 @@ jobs:
   build-desktop-linux:
     name: Build Desktop (Linux)
     needs: prepare-release
+    if: ${{ inputs.platforms != 'macos' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -312,6 +326,7 @@ jobs:
   build-local-windows:
     name: Build Local Edition (Windows)
     needs: prepare-release
+    if: ${{ inputs.platforms != 'macos' }}
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -432,6 +447,16 @@ jobs:
           security import "$CERT_PATH" -P "$CSC_KEY_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH"
+          # Sign from this keychain: with CSC_LINK set, electron-builder makes
+          # a second temporary keychain, and its set-key-partition-list fails
+          # on the macos-26 runner image of 2026-11-12.
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | sed -nE 's/.*"Developer ID Application: (.*)"$/\1/p' | head -1)
+          if [ -z "$IDENTITY" ]; then
+            echo "No Developer ID Application identity in the certificate" >&2
+            exit 1
+          fi
+          echo "CSC_NAME=$IDENTITY" >> "$GITHUB_ENV"
+          echo "CSC_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
       - name: Derive version
         id: version
@@ -466,13 +491,11 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          CSC_LINK: ${{ secrets.APPLE_CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CSC_KEY_PASSWORD }}
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
           pnpm --filter @caliptic/desktop exec electron-vite build
           VERSION="${{ steps.version.outputs.value }}"
-          if [ -z "$CSC_LINK" ]; then
+          if [ -z "${CSC_NAME:-}" ]; then
             pnpm --filter @caliptic/desktop exec electron-builder --mac --arm64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION" -c.mac.identity=null
           else
             pnpm --filter @caliptic/desktop exec electron-builder --mac --arm64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION"
@@ -503,12 +526,10 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          CSC_LINK: ${{ secrets.APPLE_CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CSC_KEY_PASSWORD }}
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
           VERSION="${{ steps.version.outputs.value }}"
-          if [ -z "$CSC_LINK" ]; then
+          if [ -z "${CSC_NAME:-}" ]; then
             pnpm --filter @caliptic/desktop exec electron-builder --mac --x64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION" -c.mac.identity=null
           else
             pnpm --filter @caliptic/desktop exec electron-builder --mac --x64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION"
@@ -518,6 +539,7 @@ jobs:
   build-local-linux:
     name: Build Local Edition (Linux)
     needs: prepare-release
+    if: ${{ inputs.platforms != 'macos' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -622,6 +644,7 @@ jobs:
   mark-latest:
     name: Mark as latest when complete
     needs: [build-desktop-windows, build-desktop-mac, build-desktop-linux, build-local-windows, build-local-mac, build-local-linux]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
