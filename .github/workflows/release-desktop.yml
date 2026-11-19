@@ -221,6 +221,17 @@ jobs:
       # reserved briefly, causing the next POST to 422. Pre-deleting with
       # a sleep gives the API time to converge before the x64 build uploads
       # a merged manifest covering both arches.
+      - name: Keep the arm64 update manifest
+        # The x64 build replaces latest-mac.yml with one that lists only x64 files;
+        # the merge step after it puts the arm64 files back.
+        run: |
+          M=$(find apps/desktop/dist -name latest-mac.yml | head -1)
+          if [ -z "$M" ]; then
+            echo "No arm64 latest-mac.yml was written" >&2
+            exit 1
+          fi
+          cp "$M" "$RUNNER_TEMP/latest-mac.yml-arm64.yml"
+
       - name: Pre-delete auto-update manifest (avoid overwrite race)
         env:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
@@ -249,6 +260,44 @@ jobs:
   # ── Linux ───────────────────────────────────────────────────────────────────
   # Runs in PARALLEL with Windows and macOS (no `needs:` link).
   # No code signing needed for Linux.
+      - name: Publish the merged update manifest
+        # latest-mac.yml must list the arm64 and the x64 files: with only x64 files,
+        # electron-updater moves Apple Silicon Macs to the x64 build.
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          X64=$(grep -l "mac-x64" $(find apps/desktop/dist -name latest-mac.yml) | head -1)
+          if [ -z "$X64" ]; then
+            echo "No x64 latest-mac.yml was written" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/merged"
+          OUT="$RUNNER_TEMP/merged/latest-mac.yml"
+          node - "$RUNNER_TEMP/latest-mac.yml-arm64.yml" "$X64" "$OUT" <<'EOF'
+          // Put the arm64 files of the arm64 manifest in front of the x64 ones,
+          // so electron-updater gives Apple Silicon Macs the arm64 build.
+          const fs = require("fs");
+          const [armPath, x64Path, outPath] = process.argv.slice(2);
+          const FILES = /^files:\n((?:  .*\n)+)/m;
+          const read = (p) => fs.readFileSync(p, "utf8");
+          const version = (t) => (t.match(/^version: (.+)$/m) || [])[1];
+          const files = (t, p) => {
+            const m = t.match(FILES);
+            if (!m) throw new Error(`${p}: no files list`);
+            return m[1];
+          };
+          const arm = read(armPath), x64 = read(x64Path);
+          if (version(arm) !== version(x64)) throw new Error(`versions differ: ${version(arm)} vs ${version(x64)}`);
+          const armFiles = files(arm, armPath), x64Files = files(x64, x64Path);
+          if (!/^  - url: .*arm64/m.test(armFiles)) throw new Error(`${armPath}: no arm64 files`);
+          if (/^  - url: .*arm64/m.test(x64Files)) throw new Error(`${x64Path}: already lists arm64 files`);
+          fs.writeFileSync(outPath, x64.replace(FILES, () => `files:\n${armFiles}${x64Files}`));
+          EOF
+          TAG="v$(sed -n 's/^version: //p' "$OUT")"
+          gh release upload "$TAG" "$OUT" --clobber --repo caliptic-org/releases
+          echo "Published $TAG latest-mac.yml:"
+          grep "url:" "$OUT"
+
   build-desktop-linux:
     name: Build Desktop (Linux)
     needs: prepare-release
@@ -521,6 +570,17 @@ jobs:
             pnpm --filter @caliptic/desktop exec electron-builder --mac --arm64 --config electron-builder-local.yml --publish always "-c.extraMetadata.version=$VERSION"
           fi
 
+      - name: Keep the arm64 update manifest
+        # The x64 build replaces local-mac.yml with one that lists only x64 files;
+        # the merge step after it puts the arm64 files back.
+        run: |
+          M=$(find apps/desktop/dist -maxdepth 1 -name local-mac.yml | head -1)
+          if [ -z "$M" ]; then
+            echo "No arm64 local-mac.yml was written" >&2
+            exit 1
+          fi
+          cp "$M" "$RUNNER_TEMP/local-mac.yml-arm64.yml"
+
       - name: Build Go binaries (x64)
         run: |
           cd server
@@ -556,6 +616,44 @@ jobs:
           fi
 
   # ── Local Linux ────────────────────────────────────────────────────────
+      - name: Publish the merged update manifest
+        # local-mac.yml must list the arm64 and the x64 files: with only x64 files,
+        # electron-updater moves Apple Silicon Macs to the x64 build.
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          X64=$(grep -l "mac-x64" $(find apps/desktop/dist -maxdepth 1 -name local-mac.yml) | head -1)
+          if [ -z "$X64" ]; then
+            echo "No x64 local-mac.yml was written" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/merged"
+          OUT="$RUNNER_TEMP/merged/local-mac.yml"
+          node - "$RUNNER_TEMP/local-mac.yml-arm64.yml" "$X64" "$OUT" <<'EOF'
+          // Put the arm64 files of the arm64 manifest in front of the x64 ones,
+          // so electron-updater gives Apple Silicon Macs the arm64 build.
+          const fs = require("fs");
+          const [armPath, x64Path, outPath] = process.argv.slice(2);
+          const FILES = /^files:\n((?:  .*\n)+)/m;
+          const read = (p) => fs.readFileSync(p, "utf8");
+          const version = (t) => (t.match(/^version: (.+)$/m) || [])[1];
+          const files = (t, p) => {
+            const m = t.match(FILES);
+            if (!m) throw new Error(`${p}: no files list`);
+            return m[1];
+          };
+          const arm = read(armPath), x64 = read(x64Path);
+          if (version(arm) !== version(x64)) throw new Error(`versions differ: ${version(arm)} vs ${version(x64)}`);
+          const armFiles = files(arm, armPath), x64Files = files(x64, x64Path);
+          if (!/^  - url: .*arm64/m.test(armFiles)) throw new Error(`${armPath}: no arm64 files`);
+          if (/^  - url: .*arm64/m.test(x64Files)) throw new Error(`${x64Path}: already lists arm64 files`);
+          fs.writeFileSync(outPath, x64.replace(FILES, () => `files:\n${armFiles}${x64Files}`));
+          EOF
+          TAG="v$(sed -n 's/^version: //p' "$OUT")"
+          gh release upload "$TAG" "$OUT" --clobber --repo caliptic-org/releases
+          echo "Published $TAG local-mac.yml:"
+          grep "url:" "$OUT"
+
   build-local-linux:
     name: Build Local Edition (Linux)
     needs: prepare-release
