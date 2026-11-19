@@ -181,6 +181,16 @@ jobs:
           echo "CSC_NAME=$IDENTITY" >> "$GITHUB_ENV"
           echo "CSC_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
+      - name: Write App Store Connect API key (notarization)
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          if [ -n "$APPLE_API_KEY_P8" ]; then
+            mkdir -p "$RUNNER_TEMP/asc"
+            printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/asc/AuthKey.p8"
+            echo "APPLE_API_KEY=$RUNNER_TEMP/asc/AuthKey.p8" >> "$GITHUB_ENV"
+          fi
+
       - name: Clean stale release manifests
         env:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
@@ -195,8 +205,8 @@ jobs:
       - name: Build & publish macOS installer (arm64)
         env:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
@@ -225,8 +235,8 @@ jobs:
       - name: Build & publish macOS installer (x64)
         env:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
@@ -458,6 +468,16 @@ jobs:
           echo "CSC_NAME=$IDENTITY" >> "$GITHUB_ENV"
           echo "CSC_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
+      - name: Write App Store Connect API key (notarization)
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          if [ -n "$APPLE_API_KEY_P8" ]; then
+            mkdir -p "$RUNNER_TEMP/asc"
+            printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/asc/AuthKey.p8"
+            echo "APPLE_API_KEY=$RUNNER_TEMP/asc/AuthKey.p8" >> "$GITHUB_ENV"
+          fi
+
       - name: Derive version
         id: version
         run: |
@@ -488,8 +508,8 @@ jobs:
       - name: Build and publish macOS installer (arm64)
         env:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
@@ -523,8 +543,8 @@ jobs:
       - name: Build and publish macOS installer (x64)
         env:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
